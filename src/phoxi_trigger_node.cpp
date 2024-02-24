@@ -6,10 +6,20 @@
 #include <sys/stat.h>
 #include <vector>
 
-#include "ros/ros.h"
-#include "std_msgs/String.h"
+#include <ros/ros.h>
+#include <std_msgs/String.h>
+#include <sensor_msgs/PointCloud2.h>
+
+#define PHOXI_PCL_SUPPORT
 
 #include "PhoXi.h"
+
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/point_types.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/PCLPointCloud2.h>
+#include <pcl/conversions.h>
+#include <pcl_ros/transforms.h>
 
 namespace fs = std::filesystem;
 
@@ -22,23 +32,87 @@ class TriggerCameras {
 public:
     explicit TriggerCameras(std::shared_ptr<ros::NodeHandle> nh) : nh(nh) {
         sub = nh->subscribe("camera_trigger", 10, &TriggerCameras::TriggerCallback, this);
+        pc_pub = nh->advertise<sensor_msgs::PointCloud2>("point_cloud", 10);
     }
 
     void TriggerCallback(const std_msgs::String &msg) {
-        SoftwareTrigger();
+        frame_idx += 1;
+
+        using PointT = pcl::PointXYZRGBNormal;
+        using PointCloudT = pcl::PointCloud<PointT>;
+        PointCloudT combined_pcl_cloud;
+
+        for (size_t j = 0; j < SCANNERS_COUNT; ++j) {
+            auto phoxi = PhoXiDevices[j];
+            int FrameID = phoxi->TriggerFrame(true);
+            if (FrameID < 0) {
+                // If negative number is returned trigger was unsuccessful
+                std::cout << "Trigger was unsuccessful! code=" << FrameID << std::endl;
+                continue;
+            }
+
+            pho::api::PFrame frame = PhoXiDevices[j]->GetFrame();
+
+            if (!frame) {
+                std::cerr << "Frame was empty!" << std::endl;
+                continue;
+            }
+
+            auto const data_dir = "/home/andrea/phoxi_ws/src/phoxi_trigger/data/";
+            auto const stem = phoxi->HardwareIdentification.GetValue() + "_" + std::to_string(frame_idx);
+            auto const subdir = data_dir + stem + "/";
+
+            fs::create_directory(subdir);
+
+            auto const root = subdir + stem;
+            phoxi->SaveLastOutput(root + ".ply");
+            phoxi->SaveLastOutput(root + ".tif");
+            phoxi->SaveLastOutput(root + ".png");
+
+            auto pcl_cloud_ptr = boost::make_shared<PointCloudT>();
+            frame->ConvertTo<PointT>(*pcl_cloud_ptr);  // This requires the  #define PHOXI_PCL_SUPPORT
+
+            auto filtered_cloud_ptr = boost::make_shared<PointCloudT>();
+
+            // Create the filtering object
+            pcl::VoxelGrid<PointT> sor;
+            sor.setInputCloud(pcl_cloud_ptr);
+            sor.setLeafSize(0.01f, 0.01f, 0.01f);
+            sor.filter(*filtered_cloud_ptr);
+
+            // convert from millimeters to meters
+            for (int i = 0; i < filtered_cloud_ptr->points.size(); i++) {
+                filtered_cloud_ptr->points[i].x = filtered_cloud_ptr->points[i].x / 1000;
+                filtered_cloud_ptr->points[i].y = filtered_cloud_ptr->points[i].y / 1000;
+                filtered_cloud_ptr->points[i].z = filtered_cloud_ptr->points[i].z / 1000;
+            }
+
+            combined_pcl_cloud += *filtered_cloud_ptr;
+        }
+
+        sensor_msgs::PointCloud2 pc_msg;
+        pcl::toROSMsg(combined_pcl_cloud, pc_msg);
+        pc_msg.header.frame_id = "MarkerBoard";
+        pc_msg.header.stamp = ros::Time::now();
+        pc_pub.publish(pc_msg);
     }
 
-    pho::api::PPhoXi ConnectPhoXiDeviceBySerial(const std::string &HardwareIdentification) {
-        pho::api::PhoXiTimeout Timeout = pho::api::PhoXiTimeout::ZeroTimeout;
-        auto PhoXiDevice = Factory.CreateAndConnect(HardwareIdentification, Timeout);
-        if (PhoXiDevice) {
-            std::cout << "Connection to the device " << HardwareIdentification
-                      << " was successful!" << std::endl;
-            return PhoXiDevice;
-        } else {
-            std::cout << "Connection to the device " << HardwareIdentification
-                      << " was unsuccessful!" << std::endl;
-            return nullptr;
+    void Setup() {
+        try {
+            auto success = ConnectScanners();
+            if (!success) {
+                Disconnect();
+                std::cout << "Can not connect to all requested scanners." << std::endl;
+                return;
+            }
+            StartCameras();
+        } catch (std::runtime_error &InternalException) {
+            std::cout << std::endl << "Exception was thrown: " << InternalException.what() << std::endl;
+            for (auto Device: PhoXiDevices) {
+                if (Device->isConnected()) {
+                    Device->Disconnect(true);
+                }
+            }
         }
     }
 
@@ -114,6 +188,19 @@ public:
         }
     }
 
+    pho::api::PPhoXi ConnectPhoXiDeviceBySerial(const std::string &HardwareIdentification) {
+        pho::api::PhoXiTimeout Timeout = pho::api::PhoXiTimeout::ZeroTimeout;
+        auto PhoXiDevice = Factory.CreateAndConnect(HardwareIdentification, Timeout);
+        if (PhoXiDevice) {
+            std::cout << "Connection to the device " << HardwareIdentification
+                      << " was successful!" << std::endl;
+            return PhoXiDevice;
+        } else {
+            std::cout << "Connection to the device " << HardwareIdentification
+                      << " was unsuccessful!" << std::endl;
+            return nullptr;
+        }
+    }
 
     void StartCameras() {
         // Check if the device is connected
@@ -167,57 +254,10 @@ public:
         }
     }
 
-
-    void SoftwareTrigger() {
-        frame_idx += 1;
-
-        std::vector<pho::api::PFrame> Frames;
-        for (size_t j = 0; j < SCANNERS_COUNT; ++j) {
-            auto phoxi = PhoXiDevices[j];
-            int FrameID = phoxi->TriggerFrame(true);
-            if (FrameID < 0) {
-                // If negative number is returned trigger was unsuccessful
-                std::cout << "Trigger was unsuccessful! code=" << FrameID << std::endl;
-                continue;
-            }
-
-            pho::api::PFrame Frame = PhoXiDevices[j]->GetFrame();
-
-            auto const data_dir = "/home/andrea/phoxi_ws/src/phoxi_trigger/data/";
-            auto const stem = phoxi->HardwareIdentification.GetValue() + "_" + std::to_string(frame_idx);
-            auto const subdir = data_dir + stem + "/";
-
-            fs::create_directory(subdir);
-
-            auto const root = subdir + stem;
-            phoxi->SaveLastOutput(root + ".ply");
-            phoxi->SaveLastOutput(root + ".tif");
-            phoxi->SaveLastOutput(root + ".png");
-        }
-    }
-
-    void Setup() {
-        try {
-            auto success = ConnectScanners();
-            if (!success) {
-                Disconnect();
-                std::cout << "Can not connect to all requested scanners." << std::endl;
-                return;
-            }
-            StartCameras();
-        } catch (std::runtime_error &InternalException) {
-            std::cout << std::endl << "Exception was thrown: " << InternalException.what() << std::endl;
-            for (auto Device: PhoXiDevices) {
-                if (Device->isConnected()) {
-                    Device->Disconnect(true);
-                }
-            }
-        }
-    }
-
 private:
     std::shared_ptr<ros::NodeHandle> nh;
     ros::Subscriber sub;
+    ros::Publisher pc_pub;
 
     pho::api::PhoXiFactory Factory;
     std::vector<pho::api::PPhoXi> PhoXiDevices;
@@ -226,7 +266,7 @@ private:
 };
 
 int main(int argc, char *argv[]) {
-    ros::init(argc, argv, "cpp_camera_trigger");
+    ros::init(argc, argv, "phoxi_trigger");
 
     auto nh = std::make_shared<ros::NodeHandle>();
     TriggerCameras tc(nh);
