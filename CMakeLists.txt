@@ -7,6 +7,8 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
 )
 
+set(CMAKE_CXX_STANDARD 20)
+
 catkin_package()
 
 if (NOT PHO_API_CMAKE_CONFIG_PATH)
