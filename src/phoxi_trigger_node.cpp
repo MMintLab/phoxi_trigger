@@ -20,6 +20,7 @@
 #include <pcl/PCLPointCloud2.h>
 #include <pcl/conversions.h>
 #include <pcl_ros/transforms.h>
+#include <pcl/io/ply_io.h>
 
 namespace fs = std::filesystem;
 
@@ -36,14 +37,16 @@ public:
     }
 
     void TriggerCallback(const std_msgs::String &msg) {
-        frame_idx += 1;
 
         using PointT = pcl::PointXYZRGBNormal;
         using PointCloudT = pcl::PointCloud<PointT>;
         PointCloudT combined_pcl_cloud;
 
+        auto const data_dir = "/home/andrea/phoxi_ws/src/phoxi_trigger/data/";
+
         for (size_t j = 0; j < SCANNERS_COUNT; ++j) {
             auto phoxi = PhoXiDevices[j];
+            phoxi->ClearBuffer();
             int FrameID = phoxi->TriggerFrame(true);
             if (FrameID < 0) {
                 // If negative number is returned trigger was unsuccessful
@@ -58,43 +61,46 @@ public:
                 continue;
             }
 
-            auto const data_dir = "/home/andrea/phoxi_ws/src/phoxi_trigger/data/";
-            auto const stem = phoxi->HardwareIdentification.GetValue() + "_" + std::to_string(frame_idx);
-            auto const subdir = data_dir + stem + "/";
-
-            fs::create_directory(subdir);
-
-            auto const root = subdir + stem;
-            phoxi->SaveLastOutput(root + ".ply");
-            phoxi->SaveLastOutput(root + ".tif");
+            auto const stem = phoxi->HardwareIdentification.GetValue() + "_" + msg.data;
+            auto const root = data_dir + stem;
+//            phoxi->SaveLastOutput(root + ".ply");
+//            phoxi->SaveLastOutput(root + ".tif");
             phoxi->SaveLastOutput(root + ".png");
 
             auto pcl_cloud_ptr = boost::make_shared<PointCloudT>();
             frame->ConvertTo<PointT>(*pcl_cloud_ptr);  // This requires the  #define PHOXI_PCL_SUPPORT
+
+            // convert from millimeters to meters
+            for (int i = 0; i < pcl_cloud_ptr->points.size(); i++) {
+                pcl_cloud_ptr->points[i].x = pcl_cloud_ptr->points[i].x / 1000;
+                pcl_cloud_ptr->points[i].y = pcl_cloud_ptr->points[i].y / 1000;
+                pcl_cloud_ptr->points[i].z = pcl_cloud_ptr->points[i].z / 1000;
+            }
 
             auto filtered_cloud_ptr = boost::make_shared<PointCloudT>();
 
             // Create the filtering object
             pcl::VoxelGrid<PointT> sor;
             sor.setInputCloud(pcl_cloud_ptr);
-            sor.setLeafSize(0.01f, 0.01f, 0.01f);
+            sor.setLeafSize(0.002f, 0.002f, 0.002f);
             sor.filter(*filtered_cloud_ptr);
-
-            // convert from millimeters to meters
-            for (int i = 0; i < filtered_cloud_ptr->points.size(); i++) {
-                filtered_cloud_ptr->points[i].x = filtered_cloud_ptr->points[i].x / 1000;
-                filtered_cloud_ptr->points[i].y = filtered_cloud_ptr->points[i].y / 1000;
-                filtered_cloud_ptr->points[i].z = filtered_cloud_ptr->points[i].z / 1000;
-            }
 
             combined_pcl_cloud += *filtered_cloud_ptr;
         }
+
+        std::cout << "Combined cloud has " << combined_pcl_cloud.size() << " points.\n";
 
         sensor_msgs::PointCloud2 pc_msg;
         pcl::toROSMsg(combined_pcl_cloud, pc_msg);
         pc_msg.header.frame_id = "MarkerBoard";
         pc_msg.header.stamp = ros::Time::now();
         pc_pub.publish(pc_msg);
+
+        auto const combined_stem = "combined_scan_" + msg.data;
+        auto const combined_root = data_dir + combined_stem;
+
+        pcl::PLYWriter writer;
+        writer.write(combined_root + ".ply", combined_pcl_cloud, false);
     }
 
     void Setup() {
@@ -262,7 +268,6 @@ private:
     pho::api::PhoXiFactory Factory;
     std::vector<pho::api::PPhoXi> PhoXiDevices;
     std::vector<pho::api::PhoXiDeviceInformation> DeviceList;
-    int frame_idx = 0;
 };
 
 int main(int argc, char *argv[]) {
